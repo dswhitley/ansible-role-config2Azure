@@ -1,0 +1,16 @@
+---
+dependencies: []
+
+galaxy_info:
+  author: dswhitley
+  description: config a VM in prep for being uploaded to Azure
+  license: license (MIT)
+  min_ansible_version: 2.4
+  platforms:
+  - name: EL
+    versions:
+    - 6
+    - 7
+  galaxy_tags:
+    - rhel
+    - azure

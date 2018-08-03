@@ -1,0 +1,190 @@
+---
+# all of these tasks will require root permissions so use become: yes
+# when calling the role
+- name: assert the user/pass for subscribing is provided
+  assert:
+    that:
+      - sm_user is defined
+      - sm_pass is defined
+    msg: "A username and password need to be provided, possibly via vars_prompt in the originating playbook..."
+
+- name: Hyper-V drivers| insert into dracut.conf
+  blockinfile:
+    path: /etc/dracut.conf
+    insertafter: '^# additional kernel modules to the default'
+    block: |
+      add_drivers+=" hv_vmbus "
+      add_drivers+=" hv_netvsc "
+      add_drivers+=" hv_storvsc "
+
+- name: Hyper-V drivers| capture initrd info
+  command: lsinitrd
+  register: initrd
+  changed_when: no
+
+- name: config2| stop cloud-init service
+  service:
+    name: cloud-init
+    state: stopped
+  register: service_cmd
+  failed_when: '"Could not find" not in service_cmd.msg'
+
+- name: config3| remove cloud-init package
+  package:
+    name: cloud-init
+    state: absent
+
+- name: config4| enable ssh password authentication
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^PasswordAuthentication'
+    state: present
+    line: 'PasswordAuthentication yes'
+
+- name: config6| set generic hostname
+  hostname:
+    name: localhost.localdomain
+
+- name: config7| copy over generic ifcfg-eth0
+  copy:
+    dest: /etc/sysconfig/network-scripts/ifcfg-eth0
+#    backup: yes
+    content: |
+      DEVICE="eth0"
+      BOOTPROTO="dhcp"
+      ONBOOT="yes"
+      TYPE="Ethernet"
+      USERCTL="no"
+      PEERDNS="yes"
+      IPV6INIT="no"
+
+- name: config8| remove persistent network device rules
+  file:
+    name: "{{ item }}"
+    state: absent
+  with_items:
+    - /etc/udev/rules.d/70-persistent-net.rules
+    - /etc/udev/rules.d/75-persistent-net-generator.rules
+
+- name: config9| configure network to start automatically
+  service:
+    name: network
+    enabled: yes
+
+- name: config10| configure ssh to start automatically
+  service:
+    name: sshd
+    enabled: yes
+
+- name: config13| register system and auto-attach
+  redhat_subscription:
+    state: present
+    username: "{{ sm_user }}"
+    password: "{{ sm_pass }}"
+    autosubscribe: yes
+
+- name: config14| disable all repos
+  rhsm_repository:
+    name: '*'
+    state: disabled
+
+- name: config14| enable repos needed for WALinuxAgent
+  rhsm_repository:
+    name: "{{ item }}"
+    state: enabled
+  with_items:
+    - rhel-{{ ansible_distribution_major_version }}-server-extras-rpms
+    - rhel-{{ ansible_distribution_major_version }}-server-rpms
+
+- name: config16| install WALinuxAgent
+  package:
+    name: WALinuxAgent
+    state: present
+
+- name: config16| enable waagent service
+  service:
+    name: waagent
+    state: started
+    enabled: yes
+  
+- name: config17| modify /etc/waagent.conf
+  replace:
+    path: /etc/waagent.conf
+#    backup: yes
+    regexp: '{{ item.regex }}'
+    replace: '{{ item.replace }}'
+  with_items:
+    - { regex: '(Provisioning\.DeleteRootPassword=).*', replace: '\1y' }
+    - { regex: '(ResourceDisk\.Filesystem=).*', replace: '\1ext4' }
+    - { regex: '(ResourceDisk\.EnableSwap=).*', replace: '\1y' }
+    - { regex: '(ResourceDisk\.SwapSizeMB)=.*', replace: '\1=2048' }
+
+- name: config18| unregister
+  redhat_subscription:
+    state: absent
+
+- name: config20| deprovision w/ waagent
+  command: waagent -force -deprovision
+
+
+
+- name: do these tasks for RHEL6 systems
+  block:
+    - name: rhel6| debug
+      debug:
+        msg: this is a rhel6 system
+    - name: rhel6|Hyper-V drivers| regenerate the intramfs image
+      command: dracut -f -v
+      when: initrd.stdout.find("hv_vmbus") == -1 or
+            initrd.stdout.find("hv_netvsc") == -1 or
+            initrd.stdout.find("hv_storvsc") == -1
+    - name: rhel6|config5| disable NetworkManager
+      service:
+        name: NetworkManager
+        state: stopped
+        enabled: no
+      register: service_cmd
+      failed_when: '"Could not find" not in service_cmd.msg'
+
+    - name: rhel6|config11| modify boot params (remove existing)
+      replace:
+        path: /boot/grub/grub.conf
+#        backup: yes
+        regexp: '(console|crashkernel|earlyprintk|rootdelay|numa)=.*? | (rhgb|quiet)'
+    - name: rhel6|config11| modify boot params (insert new values)
+      replace:
+        path: /boot/grub/grub.conf
+#        backup: yes
+        regexp: '(\s*kernel.*)$'
+        replace: '\1 crashkernel=256M earlyprintk=ttyS0 console=ttyS0 rootdelay=300 numa=off'
+  when: ansible_distribution_major_version == "6"
+
+- name: do these tasks for RHEL7 systems
+  block:
+    - name: rhel7| debug
+      debug:
+        msg: this is a rhel7 system
+    - name: rhel7|Hyper-V drivers| regenerate the intramfs image
+      command: dracut -f -v --regenerate-all
+      when: initrd.stdout.find("hv_vmbus") == -1 or
+            initrd.stdout.find("hv_netvsc") == -1 or
+            initrd.stdout.find("hv_storvsc") == -1
+
+    - name: rhel7|config11| modify boot params (remove existing)
+      replace:
+        path: /etc/default/grub
+#        backup: yes
+        regexp: '(console|crashkernel|earlyprintk|rootdelay)=.*? | (rhgb|quiet)'
+    - name: rhel7|config11| modify boot params (insert new values)
+      replace:
+        path: /etc/default/grub
+#        backup: yes
+        regexp: '(^GRUB_CMDLINE_LINUX.*)"$'
+        replace: '\1 crashkernel=256M earlyprintk=ttyS0 console=ttyS0 rootdelay=300"'
+    - name: rhel7|config12| regenerate grub.cfg
+      command: grub2-mkconfig -o /boot/grub2/grub.cfg
+  when: ansible_distribution_major_version == "7"
+
+
+- name: config21| clear history and shutdown
+  shell: "export HISTSIZE=0 && /sbin/shutdown -h +1"
